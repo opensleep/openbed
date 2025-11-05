@@ -20,24 +20,24 @@ Initial BOM was created after a teardown published on reddit from my reddit post
 [reddit link](https://www.reddit.com/r/EightSleep/comments/18xwllx/need_pictures_of_8sleep_pod3_internals_for_diy/)
 
 #### 8Sleep Pod 2 internals:
- - 4 peltier TEC 127106FX (water sealed version of the TEC12706 with slightly higher efficiency) $20
-   - There are 2 peltier coolers for each side of the bed. So TEC12706 = 12v 6 amp peak draw * 2 = 12v 12amp necessary per person.
-   - Two TEC12703's were acquired for testing to see if a lower power (3 amps) would result in significantly worse performance. 
- - A generic 12v water pump running at low power for reduced noise (one for each side). $16
- - A no-contact water level meter placed outside the water reservoir. $5
- - A thermometer placed on the heat sink to detect overheating and shut the unit down if it malfunctions. $3
- - A Meanwell (300W?) power supply $50
- - (assumed) A Thermometer within the water reservoir to confirm the correct temperature and adjust for drift. $3
- - A solenoid valve (not entirely sure of the purpose, probably for drainage or to help with temp control. $5
-   - Reviews mention pod 2 has an annoying clicking noise, would be the solenoid valve, so this should be replaced anyways. 
- - Custom mounting brackets for the TECs, the cold side is only exposed to the waterblock, hot side is always facing the radiator unless polarity is reversed. $15
- - They use thin 0.14mm no mess thermal pads for the TEC mounts instead of thermal paste $3
- - Black TPV tubing secured with zip ties $15
- - Reservoir float valve (separate from the magnetic water level sensor? Max fill vs min fill?) $5
- - The waterblock is housed in styrofoam thermal insulation to isolate the cold plates from the hot radiator. $3
- - A custom ARM board running a cheap chipset. Has controls for polarity and current for TECS, and inputs for the other modules. (pi/arduino should work as well) $80
- - Case: injection molded plastic: $20 (after one-off mold cost)
- - Custom quick connect connectors: maybe $10
+| Component & key notes                                                                                                                                                                                                                                             | Est. cost (USD) |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------: |
+| 4× Peltier TEC 127106FX (water-sealed TEC12706 variant; slightly higher efficiency)<br>• 2 Peltier coolers per bed side → TEC12706 draws 12 V × 6 A peak → per person: 12 V, ~12 A required<br>• Two TEC12703 units acquired for testing (lower-power 3 A option) |             $20 |
+| Generic 12 V water pump (run at low power for reduced noise; one per side)                                                                                                                                                                                        |             $16 |
+| No-contact water level meter (mounted outside reservoir)                                                                                                                                                                                                          |              $5 |
+| Thermometer on heat sink (detect overheating; shut down on fault)                                                                                                                                                                                                 |              $3 |
+| Meanwell power supply (≈300 W?)                                                                                                                                                                                                                                   |             $50 |
+| Thermometer in water reservoir (confirm temp; adjust for drift)                                                                                                                                                                                                   |              $3 |
+| Solenoid valve (likely for drainage or temp control)<br>• Reviews mention Pod 2 clicking noise—probably this valve; consider replacing                                                                                                                            |              $5 |
+| Custom mounting brackets for TECs (cold side to waterblock; hot side to radiator unless polarity reversed)                                                                                                                                                        |             $15 |
+| 0.14 mm “no-mess” thermal pads for TEC mounts (instead of paste)                                                                                                                                                                                                  |              $3 |
+| Black TPV tubing, secured with zip ties                                                                                                                                                                                                                           |             $15 |
+| Reservoir float valve (separate from magnetic water-level sensor? max-fill vs min-fill)                                                                                                                                                                           |              $5 |
+| Waterblock housed in styrofoam insulation (isolate cold plates from hot radiator)                                                                                                                                                                                 |              $3 |
+| Custom ARM control board (cheap chipset) with polarity/current control for TECs; inputs for other modules (Pi/Arduino would also work)                                                                                                                            |             $80 |
+| Case: injection-molded plastic (unit cost after one-off mold)                                                                                                                                                                                                     |             $20 |
+| Custom quick-connect fittings                                                                                                                                                                                                                                     |            ~$10 |
+
 
 Note: Their radiator is not custom, all parts except for the arm board are available on Alibaba and Aliexpress. Radiator cost (bulk) $15 single sample ($80).
 
