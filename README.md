@@ -41,11 +41,6 @@ Initial BOM was created after a teardown published on reddit from my reddit post
 | **Total estimated pod cost (incl. shipping, taxes, extra BOM)** | **~$300** |
 
 
-
-Note: Their radiator is not custom, all parts except for the arm board are available on Alibaba and Aliexpress. Radiator cost (bulk) $15 single sample ($80).
-
-##### Total estimated pod cost (+ shipping, taxes, extra bom cost): ~$300
-
 ### Assembling the proof of concept
 The first cooler test consisted of two TEC12703 peltier coolers. They were mounted to 40x80mm watercooling block, which was then mounted to generic CPU air cooler.
 CPU thermal cooling paste was applied between the surface of the watercooling block and the CPU cooler copper contact plate.
