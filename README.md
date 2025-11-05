@@ -1,6 +1,14 @@
 # openbed
 WIP project to build an open source cooling mattress. The goal of openbed is to provide a resource that allows you to affordably get a perfectly optimized sleep. To achieve this goal, all components should be sourced from common items without overuse of speciality vendors and custom parts. If a custom part is used, it should be simple to install and order a replacement from the design files. Soldering should be minimal and all parts should be simple to swap. Included software should be entirely open source and work without a network connection.
 
+**OpenBed/OpenCooler/Pod (haven't decided on a final name) will be hot swappable with several potential accessories:**
+1. A pet cooler pad in large (dog) and small (cat/other) sizes to give your animal the best sleep possible
+2. A pillow cover for a standard sized pillow
+3. A single mattress cover, then mattress covers of other sizes.
+4. Chiller connect for bioreactors
+5. Medical hospital mat version for post surgery and long term care
+6. Wearable option for sports/vr training and recovery 
+
 ### Prototype 1 TODO:
 - [x] Test feasibility (concept works, simple to implement)
 - [x] Create a product design mockup
@@ -14,7 +22,8 @@ WIP project to build an open source cooling mattress. The goal of openbed is to 
 - [ ] 5/100 Create a prototype cooling pillow
 
 ## First prototype
-Proof of concept and testing components. 
+Proof of concept and testing components. The cooler prototype is meant to heat and cool a single mattress/pillow/blanket. It is not a split design for two people. Future iterations could do both, but for now I am focusing on raw cooling power and simplicity of design. No valves to exchange water flow, no separate reservoirs for hot and cool water. 
+
 Initial BOM was created after a teardown published on reddit from my reddit post: 
 
 [reddit link](https://www.reddit.com/r/EightSleep/comments/18xwllx/need_pictures_of_8sleep_pod3_internals_for_diy/)
