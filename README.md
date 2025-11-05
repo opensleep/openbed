@@ -3,20 +3,29 @@ WIP project to build an open source cooling mattress. The goal of openbed is to 
 
 ### Prototype 1 TODO:
 [x] Test feasibility (concept works, simple to implement)
+
 [x] Create a product design mockup
+
 [ ] 88/100 Source components
+
 [ ] 78/100 Build the thermal engine assembly for the TEC watercooling block
+
 [ ] 35/100 Design and build the case for all components that is also protected against water spillage
+
 [ ] 26/100 Design and implement an easily refillable 3D printed(?) water reservoir
+
 [ ] 15/100 Build mounting box for TEC controllers 
+
 [ ] 10/100 Build mount for Arduino controller module
+
 [ ] 5/100 Optimize quick connect system for modular accessories
+
 [ ] 5/100 Create a prototype cooling pillow
 
 ## First prototype
 Proof of concept and testing components. 
 Initial BOM was created after a teardown published on reddit from my reddit post: 
-(https://www.reddit.com/r/EightSleep/comments/18xwllx/need_pictures_of_8sleep_pod3_internals_for_diy/)[reddit link]
+[https://www.reddit.com/r/EightSleep/comments/18xwllx/need_pictures_of_8sleep_pod3_internals_for_diy/](reddit link)
 
 #### 8Sleep Pod 2 internals:
  - 4 peltier TEC 127106FX (water sealed version of the TEC12706 with slightly higher efficiency)
