@@ -37,8 +37,10 @@ Initial BOM was created after a teardown published on reddit from my reddit post
  - A custom ARM board running a cheap chipset. Has controls for polarity and current for TECS, and inputs for the other modules. (pi/arduino should work as well) $80
  - Case: injection molded plastic: $20 (after one-off mold cost)
  - Custom quick connect connectors: maybe $10
+
 Note: Their radiator is not custom, all parts except for the arm board are available on Alibaba and Aliexpress. Radiator cost (bulk) $15 single sample ($80).
-Total estimated pod cost (+ shipping, taxes, extra bom cost): ~$300
+
+##### Total estimated pod cost (+ shipping, taxes, extra bom cost): ~$300
 
 ### Assembling the proof of concept
 The first cooler test consisted of two TEC12703 peltier coolers. They were mounted to 40x80mm watercooling block, which was then mounted to generic CPU air cooler.
