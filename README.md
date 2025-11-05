@@ -1,5 +1,5 @@
 # openbed
-WIP project to build an open source cooling mattress. The goal of openbed is to provide a resource that allows you to affordably get a perfectly optimized sleep.
+WIP project to build an open source cooling mattress. The goal of openbed is to provide a resource that allows you to affordably get a perfectly optimized sleep. To achieve this goal, all components should be sourced from common items without overuse of speciality vendors and custom parts. If a custom part is used, it should be simple to install and order a replacement from the design files. Soldering should be minimal and all parts should be simple to swap. 
 
 ### Prototype 1 TODO:
 - [x] Test feasibility (concept works, simple to implement)
