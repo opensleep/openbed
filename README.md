@@ -16,7 +16,8 @@ WIP project to build an open source cooling mattress. The goal of openbed is to 
 ## First prototype
 Proof of concept and testing components. 
 Initial BOM was created after a teardown published on reddit from my reddit post: 
-[https://www.reddit.com/r/EightSleep/comments/18xwllx/need_pictures_of_8sleep_pod3_internals_for_diy/](reddit link)
+
+[reddit link](https://www.reddit.com/r/EightSleep/comments/18xwllx/need_pictures_of_8sleep_pod3_internals_for_diy/)
 
 #### 8Sleep Pod 2 internals:
  - 4 peltier TEC 127106FX (water sealed version of the TEC12706 with slightly higher efficiency) $20
