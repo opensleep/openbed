@@ -53,3 +53,6 @@ Initial BOM was created after a teardown published on reddit from my reddit post
 ### Assembling the proof of concept
 The first cooler test consisted of two TEC12703 peltier coolers. They were mounted to 40x80mm watercooling block, which was then mounted to generic CPU air cooler.
 CPU thermal cooling paste was applied between the surface of the watercooling block and the CPU cooler copper contact plate.
+
+- The thermometer needs to be inserted into the water tank. Idea presented: ip67 wire grommet for simple insertion and removal. 
+- Caps are difficult to fill, and it can be tough to see how much water is needed before it overflows. Solution: A jerry can fill/cap system. Use clear acrylic with acrylic cement for the water reservoir. 
