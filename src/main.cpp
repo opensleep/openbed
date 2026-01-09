@@ -101,7 +101,7 @@ static const char *MDNS_HOST = "tec-ctrl"; // http://tec-ctrl.local/
 
 // ======================= POLARITY DEFAULTS =======================
 // Permanent defaults in code (edit after testing):
-static const bool TEC_DIR_INVERT_DEFAULT[NUM_TEC] = {false, false, false, false};
+static const bool TEC_DIR_INVERT_DEFAULT[NUM_TEC] = {false, true, false, true};
 
 // ======================= GLOBALS =======================
 
