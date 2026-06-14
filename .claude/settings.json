@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(head -60 prototyping/networking-version.cpp)",
+      "Bash(ls *.md)"
+    ]
+  }
+}

@@ -1,11 +1,17 @@
 /*
-  ESP32 TEC Controller — NETWORK CONTROL VERSION (no dial input)
+  ESP32 TEC Bed-Cooler Controller — NETWORK CONTROL VERSION (no dial input)
 
-  Robust display init changes vs last version:
-  - TFT SPI speed reduced to 8 MHz (much more stable)
-  - Removed startWrite()/endWrite() transactions
-  - Forces a clear + basic text immediately after begin()
-  - Keeps clean stats-only screen (Water, Target, SSID, IP)
+  HARDWARE REVISION (current sensors removed):
+  - 4x TEC via Cytron MD13S (PWM + DIR)              -> unchanged
+  - ACS712 current sensors                            -> REMOVED
+  - Coolant temperature probe (2-wire NTC thermistor) -> NEW, on the pump block.
+       This is the regulated "water" temperature used by the PID loop.
+  - 2x DS18B20 (OneWire)                              -> glued to the TEC heatsinks,
+       for monitoring + heatsink over-temperature protection.
+  - PWM D5 pump (4 lead: 12V red/black power, PWM blue, tach green)
+       Pump runs ONLY when the water-level sensor reports the loop is full.
+  - XKC-Y26 non-contact water-level sensor            -> NEW (submersion interlock)
+  - ST7789 TFT display, can be fully blanked from the settings menu (dark room).
 */
 
 #include <Arduino.h>
@@ -31,28 +37,41 @@
 // ======================= USER HARDWARE CONFIG =======================
 
 static const int NUM_TEC = 4;
+static const int NUM_HEATSINK = 2; // DS18B20 sensors glued to the heatsinks
 
 // Cytron MD13S control pins (PWM + DIR)
 static const int TEC_PWM_PINS[NUM_TEC] = {25, 27, 32, 16};
 static const int TEC_DIR_PINS[NUM_TEC] = {26, 14, 33, 17};
 
-// ACS712 analog pins (ADC1)
-static const int ACS_ADC_PINS[NUM_TEC] = {34, 35, 36, 39};
-
-// DS18B20
+// DS18B20 OneWire bus (now carries the 2 heatsink sensors)
 static const int ONE_WIRE_PIN = 13;
+
+// Coolant temperature probe: 2-wire NTC thermistor on the pump block.
+// Wiring of the divider:  3.3V --- NTC --- [ADC node] --- R_FIXED --- GND
+static const int NTC_ADC_PIN = 34; // input-only ADC1 pin (was an ACS712 pin)
+
+// PWM D5 pump
+static const int PUMP_PWM_PIN = 19;  // -> pump BLUE wire (PWM control input)
+static const int PUMP_TACH_PIN = 22; // <- pump GREEN wire (tach / speed output)
+
+// XKC-Y26 water-level sensor (YELLOW signal wire)
+static const int WATER_LEVEL_PIN = 21;
+// XKC-Y26 OUT is HIGH when liquid is detected (black MODE wire left floating =
+// normally-open / positive output). Set false if you short MODE->GND (inverted).
+static const bool WATER_LEVEL_ACTIVE_HIGH = true;
 
 // TFT SPI pins
 static const int TFT_SCK = 18;
 static const int TFT_MOSI = 23;
 static const int TFT_DC = 4;
 
-// If CS is tied to GND, keep GFX_NOT_DEFINED.
-// If you can wire CS to a GPIO (recommended), set it here (ex: 5) and wire it.
-static const int TFT_CS = GFX_NOT_DEFINED;
+// TFT backlight control (drives the BLK/BL pin). Lets us fully blank the panel
+// for a dark room. Set to GFX_NOT_DEFINED if BL is hard-wired to 3V3.
+static const int TFT_BL = 15;
 
-// If you can wire RST to a GPIO (recommended), set it here (ex: 15) and wire it.
-// Otherwise keep GFX_NOT_DEFINED.
+// If CS is tied to GND, keep GFX_NOT_DEFINED.
+static const int TFT_CS = GFX_NOT_DEFINED;
+// If you can wire RST to a GPIO, set it here. Otherwise keep GFX_NOT_DEFINED.
 static const int TFT_RST = GFX_NOT_DEFINED;
 
 // ST7789 170x320 + offsets
@@ -69,17 +88,28 @@ static const int TFT_ROTATION = 1;
 // IMPORTANT: lower SPI speed for stability
 static const uint32_t TFT_SPI_SPEED = 8000000; // 8 MHz
 
-// ======================= ELECTRICAL CALIBRATION =======================
+// ======================= NTC CALIBRATION =======================
+// Standard 10k NTC, beta 3950, with a 10k fixed resistor, supplied from 3.3V.
+static const float NTC_SUPPLY_MV = 3300.0f;
+static const float NTC_R_FIXED = 10000.0f; // fixed divider resistor (ohms)
+static const float NTC_R0 = 10000.0f;      // NTC resistance at 25C
+static const float NTC_T0_K = 298.15f;     // 25C in Kelvin
+static const float NTC_BETA = 3950.0f;
 
-// ACS712 20A ~100mV/A at sensor output; 10k/10k divider => 50mV/A at ADC node
-static const float ACS_SENS_MV_PER_A_AT_ADC = 50.0f;
-static const float CURRENT_NOISE_FLOOR_A = 0.20f;
+// ======================= PUMP / TACH =======================
+static const uint32_t PUMP_PWM_FREQ_HZ = 25000; // PC/D5 standard 25 kHz
+static const uint8_t PUMP_PWM_RES_BITS = 8;
+static const int PUMP_LEDC_CH = 4; // TECs use channels 0..3
+static const float PUMP_TACH_PULSES_PER_REV = 2.0f;
+static const float DEFAULT_PUMP_SPEED_PERCENT = 70.0f;
 
 // ======================= CONTROL LIMITS =======================
 
 static const float DEFAULT_MAX_POWER_PERCENT = 75.0f;
-static const float DEFAULT_CURRENT_LIMIT_A = 10.0f;
-static const float HARD_OVERCURRENT_A = 12.5f;
+
+// Heatsink over-temperature protection (replaces the old overcurrent trip)
+static const float HEATSINK_MAX_C = 70.0f;
+static const float HEATSINK_CLEAR_C = 60.0f; // hysteresis for auto-clear
 
 // PID defaults
 static const float DEFAULT_KP = 30.0f;
@@ -100,12 +130,11 @@ static const byte DNS_PORT = 53;
 static const char *MDNS_HOST = "tec-ctrl"; // http://tec-ctrl.local/
 
 // ======================= POLARITY DEFAULTS =======================
-// Permanent defaults in code (edit after testing):
 static const bool TEC_DIR_INVERT_DEFAULT[NUM_TEC] = {false, true, false, true};
 
 // ======================= GLOBALS =======================
 
-// Display (use default SPI host by omitting VSPI param; this is more compatible)
+// Display
 Arduino_DataBus *bus = new Arduino_ESP32SPI(
     TFT_DC, TFT_CS, TFT_SCK, TFT_MOSI, GFX_NOT_DEFINED);
 
@@ -119,17 +148,32 @@ Arduino_GFX *gfx = new Arduino_ST7789(
     TFT_COL_OFFSET_1, TFT_ROW_OFFSET_1,
     TFT_COL_OFFSET_2, TFT_ROW_OFFSET_2);
 
-// DS18B20
+// DS18B20 (heatsinks)
 OneWire oneWire(ONE_WIRE_PIN);
 DallasTemperature ds18b20(&oneWire);
-static DeviceAddress waterAddr;
-static bool waterPresent = false;
+static DeviceAddress hsAddr[NUM_HEATSINK];
+static int hsCount = 0;
+static float heatsinkTempC[NUM_HEATSINK] = {NAN, NAN};
 
-// Non-blocking temp conversion
+// Non-blocking heatsink temp conversion
 static bool tempConvInFlight = false;
 static uint32_t tempConvStartMs = 0;
 static uint32_t lastTempKickMs = 0;
 static const uint16_t tempConvDelayMs = 200; // 10-bit ~187ms
+
+// Coolant (NTC) temperature
+static float waterTempC = NAN; // regulated coolant temp from the pump-block NTC
+
+// Water level
+static bool waterLevelOK = false;
+static bool waterLevelRawLast = false;
+static uint32_t waterLevelChangeMs = 0;
+
+// Pump
+static float pumpDutyApplied = 0.0f;
+static volatile uint32_t pumpTachCount = 0;
+static uint32_t lastTachSampleMs = 0;
+static float pumpRpm = 0.0f;
 
 // Preferences
 Preferences prefs;
@@ -154,13 +198,16 @@ static float targetConstC = 20.0f;
 static float profileC[24];
 
 static float maxPowerPercent = DEFAULT_MAX_POWER_PERCENT;
-static float currentLimitA = DEFAULT_CURRENT_LIMIT_A;
+
+// Pump + display settings (persisted)
+static bool pumpEnabled = true;
+static float pumpSpeedPercent = DEFAULT_PUMP_SPEED_PERCENT;
+static bool displayOn = true;
 
 static float kp = DEFAULT_KP;
 static float ki = DEFAULT_KI;
 static float kd = DEFAULT_KD;
 
-static float waterTempC = NAN;
 static float targetTempC = NAN;
 
 static float integralErr = 0.0f;
@@ -171,18 +218,13 @@ static uint32_t profileStartMs = 0;
 // Direction invert per TEC (runtime)
 static bool dirInvert[NUM_TEC] = {false, false, false, false};
 
-// Current sensing
-static float acsOffsetMv[NUM_TEC] = {0};
-static float tecCurrentAbsA[NUM_TEC] = {0};
 static float tecDutyApplied[NUM_TEC] = {0};
-
-// Overcurrent debounce + ignore window around on/off
-static uint8_t overCount[NUM_TEC] = {0};
 static uint32_t lastPowerChangeMs = 0;
 
 // Fault
 static bool faultTripped = false;
 static String faultMsg;
+static uint8_t overTempCount = 0;
 
 // Manual test
 static bool manualActive = false;
@@ -196,6 +238,8 @@ struct DispCache
 {
   String waterLine;
   String targetLine;
+  String levelLine;
+  String hsLine;
   String ssidLine;
   String ipLine;
   bool fault = false;
@@ -204,12 +248,15 @@ struct DispCache
 static DispCache dispLast;
 static bool dispStaticDrawn = false;
 static bool dispDirty = true;
+static bool dispBlankedDrawn = false; // true once we've painted the OFF (black) state
 
 // Layout (landscape 320x170)
 static int W = 0, H = 0;
 static const int M = 8;
 static int waterValX, waterValY, waterValW, waterValH;
 static int targetValX, targetValY, targetValW, targetValH;
+static int levelX, levelY, levelW, levelH;
+static int hsX, hsY, hsW, hsH;
 static int ssidX, ssidY, ssidW, ssidH;
 static int ipX, ipY, ipW, ipH;
 static int faultY, faultH;
@@ -265,6 +312,7 @@ static void resetPid()
 }
 
 static void allTecOff();
+static void setPump(float duty01);
 
 // ======================= POLARITY SNIPPET =======================
 
@@ -297,7 +345,10 @@ static void loadSettings()
   profileMode = prefs.getBool("mode", false);
   targetConstC = prefs.getFloat("tconst", 20.0f);
   maxPowerPercent = prefs.getFloat("maxpwr", DEFAULT_MAX_POWER_PERCENT);
-  currentLimitA = prefs.getFloat("ilim", DEFAULT_CURRENT_LIMIT_A);
+
+  pumpEnabled = prefs.getBool("pumpen", true);
+  pumpSpeedPercent = prefs.getFloat("pumpspd", DEFAULT_PUMP_SPEED_PERCENT);
+  displayOn = prefs.getBool("dispon", true);
 
   for (int i = 0; i < NUM_TEC; i++)
     dirInvert[i] = TEC_DIR_INVERT_DEFAULT[i];
@@ -337,7 +388,10 @@ static void saveSettings()
   prefs.putBool("mode", profileMode);
   prefs.putFloat("tconst", targetConstC);
   prefs.putFloat("maxpwr", maxPowerPercent);
-  prefs.putFloat("ilim", currentLimitA);
+
+  prefs.putBool("pumpen", pumpEnabled);
+  prefs.putFloat("pumpspd", pumpSpeedPercent);
+  prefs.putBool("dispon", displayOn);
 
   for (int i = 0; i < NUM_TEC; i++)
   {
@@ -372,7 +426,7 @@ static void saveWiFiCreds(const String &ssid, const String &pass)
   prefs.end();
 }
 
-// ======================= DS18B20 =======================
+// ======================= DS18B20 (HEATSINKS) =======================
 
 static void printDeviceAddress(const DeviceAddress &addr)
 {
@@ -389,43 +443,44 @@ static void setupDs18b20()
   pinMode(ONE_WIRE_PIN, INPUT_PULLUP);
   delay(5);
 
-  Serial.printf("GPIO13 idle level (expect 1): %d\n", digitalRead(ONE_WIRE_PIN));
+  Serial.printf("GPIO%d idle level (expect 1): %d\n", ONE_WIRE_PIN, digitalRead(ONE_WIRE_PIN));
 
   ds18b20.begin();
   int count = ds18b20.getDeviceCount();
   Serial.printf("DS18B20 device count: %d\n", count);
 
-  if (count > 0 && ds18b20.getAddress(waterAddr, 0))
+  hsCount = 0;
+  for (int i = 0; i < NUM_HEATSINK && i < count; i++)
   {
-    waterPresent = true;
-    Serial.print("DS18B20[0] addr: ");
-    printDeviceAddress(waterAddr);
-    Serial.println();
+    if (ds18b20.getAddress(hsAddr[i], i))
+    {
+      Serial.printf("DS18B20[%d] addr: ", i);
+      printDeviceAddress(hsAddr[i]);
+      Serial.println();
+      ds18b20.setResolution(hsAddr[i], 10);
+      hsCount++;
+    }
+  }
 
-    ds18b20.setResolution(waterAddr, 10);
-    ds18b20.setWaitForConversion(false);
+  ds18b20.setWaitForConversion(false);
 
-    ds18b20.requestTemperaturesByAddress(waterAddr);
+  if (hsCount > 0)
+  {
+    ds18b20.requestTemperatures();
     tempConvStartMs = millis();
     tempConvInFlight = true;
     lastTempKickMs = millis();
   }
   else
   {
-    waterPresent = false;
-    Serial.println("DS18B20 NOT detected. Check wiring + pull-up DATA->3V3.");
+    Serial.println("No heatsink DS18B20 detected. Check wiring + pull-up DATA->3V3.");
   }
 }
 
-static void serviceTemperature()
+static void serviceHeatsinkTemps()
 {
-  if (!waterPresent)
-  {
-    if (!isnan(waterTempC))
-      dispDirty = true;
-    waterTempC = NAN;
+  if (hsCount <= 0)
     return;
-  }
 
   uint32_t now = millis();
 
@@ -433,7 +488,7 @@ static void serviceTemperature()
   {
     if ((now - lastTempKickMs) >= 1000)
     {
-      ds18b20.requestTemperaturesByAddress(waterAddr);
+      ds18b20.requestTemperatures();
       tempConvStartMs = now;
       tempConvInFlight = true;
     }
@@ -442,144 +497,135 @@ static void serviceTemperature()
 
   if ((now - tempConvStartMs) >= tempConvDelayMs)
   {
-    float t = ds18b20.getTempC(waterAddr);
     lastTempKickMs = now;
     tempConvInFlight = false;
 
-    float newTemp = (t == DEVICE_DISCONNECTED_C) ? NAN : t;
-    if ((isnan(newTemp) != isnan(waterTempC)) || (!isnan(newTemp) && fabsf(newTemp - waterTempC) > 0.01f))
+    for (int i = 0; i < hsCount; i++)
     {
-      waterTempC = newTemp;
-      dispDirty = true;
-    }
-  }
-}
-
-// ======================= CURRENT SENSOR =======================
-
-static void calibrateAcsOffsets()
-{
-  allTecOff();
-  delay(300);
-
-  for (int i = 0; i < NUM_TEC; i++)
-  {
-    tecCurrentAbsA[i] = 0.0f;
-    overCount[i] = 0;
-  }
-
-  for (int i = 0; i < NUM_TEC; i++)
-  {
-    uint32_t sum = 0;
-    const int samples = 300;
-    for (int k = 0; k < samples; k++)
-    {
-      sum += (uint32_t)analogReadMilliVolts(ACS_ADC_PINS[i]);
-      delay(0);
-    }
-    acsOffsetMv[i] = (float)sum / (float)samples;
-  }
-
-  Serial.println("ACS offsets (mV @ ADC node):");
-  for (int i = 0; i < NUM_TEC; i++)
-  {
-    Serial.printf("  TEC%d: %.1f mV\n", i + 1, acsOffsetMv[i]);
-  }
-}
-
-static void updateCurrents()
-{
-  for (int i = 0; i < NUM_TEC; i++)
-  {
-    const int samples = 16;
-    uint32_t sum = 0;
-    for (int k = 0; k < samples; k++)
-      sum += (uint32_t)analogReadMilliVolts(ACS_ADC_PINS[i]);
-    float mv = (float)sum / (float)samples;
-
-    float ampsSigned = (mv - acsOffsetMv[i]) / ACS_SENS_MV_PER_A_AT_ADC;
-    float ampsAbs = fabsf(ampsSigned);
-    if (ampsAbs < CURRENT_NOISE_FLOOR_A)
-      ampsAbs = 0.0f;
-
-    float prev = tecCurrentAbsA[i];
-    tecCurrentAbsA[i] = tecCurrentAbsA[i] * 0.8f + ampsAbs * 0.2f;
-    if (fabsf(tecCurrentAbsA[i] - prev) > 0.05f)
-      dispDirty = true;
-
-    bool ignoreWindow = (millis() - lastPowerChangeMs) < 800;
-    bool relevantLoad = (tecDutyApplied[i] > 0.06f);
-
-    if (!faultTripped && !ignoreWindow && relevantLoad && (systemOn || manualActive))
-    {
-      if (tecCurrentAbsA[i] > HARD_OVERCURRENT_A)
+      float t = ds18b20.getTempC(hsAddr[i]);
+      float newTemp = (t == DEVICE_DISCONNECTED_C) ? NAN : t;
+      if ((isnan(newTemp) != isnan(heatsinkTempC[i])) ||
+          (!isnan(newTemp) && fabsf(newTemp - heatsinkTempC[i]) > 0.1f))
       {
-        if (overCount[i] < 255)
-          overCount[i]++;
-      }
-      else
-      {
-        overCount[i] = 0;
-      }
-
-      if (overCount[i] >= 5)
-      {
-        faultTripped = true;
-        faultMsg = "OVERCURRENT TEC" + String(i + 1) + " (" + String(tecCurrentAbsA[i], 1) + "A)";
-        systemOn = false;
-        manualActive = false;
-        allTecOff();
-        saveSettings();
+        heatsinkTempC[i] = newTemp;
         dispDirty = true;
       }
     }
-    else
-    {
-      overCount[i] = 0;
-    }
   }
 }
 
-static void serviceFaultAutoClear()
+static float maxHeatsinkC()
 {
-  static uint32_t zeroSince = 0;
-
-  if (!faultTripped)
+  float m = NAN;
+  for (int i = 0; i < hsCount; i++)
   {
-    zeroSince = 0;
-    return;
-  }
-  if (systemOn || manualActive)
-  {
-    zeroSince = 0;
-    return;
-  }
-
-  bool allZero = true;
-  for (int i = 0; i < NUM_TEC; i++)
-  {
-    if (tecCurrentAbsA[i] > 0.05f)
+    if (!isnan(heatsinkTempC[i]))
     {
-      allZero = false;
-      break;
+      if (isnan(m) || heatsinkTempC[i] > m)
+        m = heatsinkTempC[i];
     }
   }
+  return m;
+}
 
-  if (allZero)
+// ======================= COOLANT NTC PROBE =======================
+
+static void serviceCoolantTemp()
+{
+  const int samples = 16;
+  uint32_t sum = 0;
+  for (int k = 0; k < samples; k++)
+    sum += (uint32_t)analogReadMilliVolts(NTC_ADC_PIN);
+  float mv = (float)sum / (float)samples;
+
+  float newTemp;
+  // Out-of-range readings indicate an open or shorted probe.
+  if (mv < 50.0f || mv > (NTC_SUPPLY_MV - 50.0f))
   {
-    if (zeroSince == 0)
-      zeroSince = millis();
-    if ((millis() - zeroSince) > 2000)
+    newTemp = NAN;
+  }
+  else
+  {
+    // 3.3V -- NTC -- [node] -- R_FIXED -- GND
+    float rNtc = NTC_R_FIXED * ((NTC_SUPPLY_MV / mv) - 1.0f);
+    float tK = 1.0f / ((1.0f / NTC_T0_K) + (1.0f / NTC_BETA) * logf(rNtc / NTC_R0));
+    newTemp = tK - 273.15f;
+  }
+
+  if ((isnan(newTemp) != isnan(waterTempC)) ||
+      (!isnan(newTemp) && fabsf(newTemp - waterTempC) > 0.05f))
+  {
+    waterTempC = newTemp;
+    dispDirty = true;
+  }
+}
+
+// ======================= WATER LEVEL =======================
+
+static void serviceWaterLevel()
+{
+  bool raw = (digitalRead(WATER_LEVEL_PIN) == HIGH);
+  if (!WATER_LEVEL_ACTIVE_HIGH)
+    raw = !raw;
+
+  uint32_t now = millis();
+  if (raw != waterLevelRawLast)
+  {
+    waterLevelRawLast = raw;
+    waterLevelChangeMs = now;
+  }
+
+  // 250 ms debounce
+  if (raw != waterLevelOK && (now - waterLevelChangeMs) >= 250)
+  {
+    waterLevelOK = raw;
+    dispDirty = true;
+  }
+}
+
+// ======================= HEATSINK OVER-TEMP SAFETY =======================
+
+static void serviceOverTemp()
+{
+  float hot = maxHeatsinkC();
+
+  // Trip while running if a heatsink exceeds the limit.
+  if (!faultTripped && (systemOn || manualActive) && !isnan(hot) && hot >= HEATSINK_MAX_C)
+  {
+    if (overTempCount < 255)
+      overTempCount++;
+    if (overTempCount >= 3)
     {
-      faultTripped = false;
-      faultMsg = "";
-      zeroSince = 0;
+      faultTripped = true;
+      faultMsg = "HEATSINK OVERTEMP (" + String(hot, 1) + "C)";
+      systemOn = false;
+      manualActive = false;
+      allTecOff();
+      saveSettings();
       dispDirty = true;
     }
   }
   else
   {
-    zeroSince = 0;
+    overTempCount = 0;
+  }
+}
+
+static void serviceFaultAutoClear()
+{
+  if (!faultTripped)
+    return;
+  if (systemOn || manualActive)
+    return;
+
+  // Clear once the heatsinks have cooled below the hysteresis threshold.
+  float hot = maxHeatsinkC();
+  if (isnan(hot) || hot <= HEATSINK_CLEAR_C)
+  {
+    faultTripped = false;
+    faultMsg = "";
+    overTempCount = 0;
+    dispDirty = true;
   }
 }
 
@@ -614,6 +660,57 @@ static void allTecOff()
     setTecOutput(i, false, 0.0f);
 }
 
+// ======================= PUMP OUTPUT =======================
+
+static void IRAM_ATTR pumpTachISR()
+{
+  pumpTachCount++;
+}
+
+static void setPump(float duty01)
+{
+  duty01 = clampf(duty01, 0.0f, 1.0f);
+  const int maxDuty = (1 << PUMP_PWM_RES_BITS) - 1;
+  int counts = (int)lroundf(duty01 * (float)maxDuty);
+  counts = constrain(counts, 0, maxDuty);
+  ledcWrite(PUMP_LEDC_CH, counts);
+
+  if (fabsf(pumpDutyApplied - duty01) > 0.02f)
+    dispDirty = true;
+  pumpDutyApplied = duty01;
+}
+
+// The pump may only spin when the loop is full (sensor submerged); running it
+// dry can destroy the D5. It runs whenever the system (or a manual test) is
+// active AND there is water AND no fault.
+static void servicePump()
+{
+  bool wantPump = pumpEnabled && waterLevelOK && !faultTripped && (systemOn || manualActive);
+  setPump(wantPump ? (pumpSpeedPercent / 100.0f) : 0.0f);
+}
+
+static void servicePumpTach()
+{
+  uint32_t now = millis();
+  uint32_t dt = now - lastTachSampleMs;
+  if (dt < 1000)
+    return;
+
+  noInterrupts();
+  uint32_t c = pumpTachCount;
+  pumpTachCount = 0;
+  interrupts();
+
+  float rpm = (PUMP_TACH_PULSES_PER_REV > 0.0f)
+                  ? ((float)c * (60000.0f / (float)dt) / PUMP_TACH_PULSES_PER_REV)
+                  : 0.0f;
+  lastTachSampleMs = now;
+
+  if (fabsf(rpm - pumpRpm) > 30.0f)
+    dispDirty = true;
+  pumpRpm = rpm;
+}
+
 // ======================= TARGETING =======================
 
 static float computeProfileTarget(float &posHoursOut)
@@ -640,7 +737,8 @@ static float computeProfileTarget(float &posHoursOut)
 
 static void updateControl()
 {
-  if (faultTripped || !systemOn || isnan(waterTempC) || manualActive)
+  // TECs must never run without coolant flow: require water level OK.
+  if (faultTripped || !systemOn || !waterLevelOK || isnan(waterTempC) || manualActive)
   {
     if (!manualActive)
       allTecOff();
@@ -676,13 +774,7 @@ static void updateControl()
   float baseDuty = demandPercent / 100.0f;
 
   for (int i = 0; i < NUM_TEC; i++)
-  {
-    float duty = baseDuty;
-    float amps = tecCurrentAbsA[i];
-    if (amps > currentLimitA && amps > 0.2f)
-      duty *= (currentLimitA / amps);
-    setTecOutput(i, heatMode, duty);
-  }
+    setTecOutput(i, heatMode, baseDuty);
 }
 
 // ======================= MANUAL TEST =======================
@@ -710,7 +802,8 @@ static void serviceManualTest()
   if (!manualActive)
     return;
 
-  if (faultTripped)
+  // Stop the test on a fault or if the loop runs dry (TECs would overheat).
+  if (faultTripped || !waterLevelOK)
   {
     manualActive = false;
     allTecOff();
@@ -736,7 +829,7 @@ static void serviceManualTest()
   }
 }
 
-// ======================= DISPLAY (clean stats) =======================
+// ======================= DISPLAY =======================
 
 static void clearBox(int x, int y, int w, int h)
 {
@@ -752,20 +845,37 @@ static String truncateToFit(const String &s, int maxChars)
   return s.substring(0, maxChars - 3) + "...";
 }
 
+static void applyBacklight(bool on)
+{
+  if (TFT_BL == GFX_NOT_DEFINED)
+    return;
+  digitalWrite(TFT_BL, on ? HIGH : LOW);
+}
+
 static void computeLayout()
 {
   W = gfx->width();
   H = gfx->height();
 
   waterValX = 120;
-  waterValY = 22;
+  waterValY = 18;
   waterValW = W - waterValX - M;
-  waterValH = 50;
+  waterValH = 36;
 
   targetValX = 120;
-  targetValY = 78;
+  targetValY = 64;
   targetValW = W - targetValX - M;
-  targetValH = 50;
+  targetValH = 36;
+
+  levelX = M;
+  levelY = 108;
+  levelW = W - 2 * M;
+  levelH = 14;
+
+  hsX = M;
+  hsY = 124;
+  hsW = W - 2 * M;
+  hsH = 12;
 
   ssidX = M;
   ssidY = H - 24;
@@ -791,13 +901,13 @@ static void drawDisplayStatic()
   gfx->setTextColor(WHITE);
 
   gfx->setTextSize(2);
-  gfx->setCursor(M, 26);
+  gfx->setCursor(M, 22);
   gfx->print("WATER");
 
-  gfx->setCursor(M, 82);
+  gfx->setCursor(M, 68);
   gfx->print("TARGET");
 
-  gfx->drawLine(M, 68, W - M, 68, rgb565(40, 40, 40));
+  gfx->drawLine(M, 58, W - M, 58, rgb565(40, 40, 40));
   gfx->drawLine(M, H - 28, W - M, H - 28, rgb565(40, 40, 40));
 
   dispLast = DispCache();
@@ -806,16 +916,34 @@ static void drawDisplayStatic()
 
 static void drawDisplayDynamicIfNeeded()
 {
+  // Display fully off (dark room): blank panel + backlight off, draw nothing.
+  if (!displayOn)
+  {
+    if (!dispBlankedDrawn)
+    {
+      gfx->fillScreen(BLACK);
+      applyBacklight(false);
+      dispBlankedDrawn = true;
+      dispStaticDrawn = false; // force full redraw when turned back on
+    }
+    return;
+  }
+
+  if (dispBlankedDrawn)
+  {
+    applyBacklight(true);
+    dispBlankedDrawn = false;
+    dispStaticDrawn = false;
+  }
+
   if (!dispStaticDrawn)
     drawDisplayStatic();
   if (!dispDirty)
     return;
 
   String waterLine;
-  if (!waterPresent)
-    waterLine = "SENSOR";
-  else if (isnan(waterTempC))
-    waterLine = "____";
+  if (isnan(waterTempC))
+    waterLine = "PROBE?";
   else
     waterLine = String(waterTempC, 2) + "C";
 
@@ -827,9 +955,20 @@ static void drawDisplayDynamicIfNeeded()
   }
   String targetLine = String(tgt, 2) + "C";
 
+  String levelLine = waterLevelOK ? "LEVEL: FULL" : "LEVEL: NEEDS WATER";
+
+  String hsLine = "HS ";
+  for (int i = 0; i < NUM_HEATSINK; i++)
+  {
+    if (i)
+      hsLine += " ";
+    hsLine += String(i + 1) + ":";
+    hsLine += isnan(heatsinkTempC[i]) ? String("--") : String(heatsinkTempC[i], 0);
+  }
+  hsLine += "C PUMP:" + String((int)pumpRpm);
+
   String ssidLine;
   String ipLine;
-
   if (apMode)
   {
     ssidLine = String("SSID: ") + AP_SSID;
@@ -837,37 +976,54 @@ static void drawDisplayDynamicIfNeeded()
   }
   else
   {
-    String shownSsid = truncateToFit(staSSID, 26);
-    ssidLine = "SSID: " + shownSsid;
+    ssidLine = "SSID: " + truncateToFit(staSSID, 26);
     ipLine = "IP: " + staIP + "  tec-ctrl.local";
   }
 
   bool f = faultTripped;
   String faultLine = f ? ("FAULT: " + faultMsg) : "";
 
-  // WATER value
   if (waterLine != dispLast.waterLine)
   {
     clearBox(waterValX, waterValY, waterValW, waterValH);
     gfx->setTextColor(WHITE);
     gfx->setTextSize(4);
-    gfx->setCursor(waterValX, waterValY + 6);
+    gfx->setCursor(waterValX, waterValY + 4);
     gfx->print(waterLine);
     dispLast.waterLine = waterLine;
   }
 
-  // TARGET value
   if (targetLine != dispLast.targetLine)
   {
     clearBox(targetValX, targetValY, targetValW, targetValH);
     gfx->setTextColor(WHITE);
     gfx->setTextSize(4);
-    gfx->setCursor(targetValX, targetValY + 6);
+    gfx->setCursor(targetValX, targetValY + 4);
     gfx->print(targetLine);
     dispLast.targetLine = targetLine;
   }
 
-  // SSID line
+  // Water level status (green = full, red = needs water)
+  if (levelLine != dispLast.levelLine)
+  {
+    clearBox(levelX, levelY, levelW, levelH);
+    gfx->setTextSize(1);
+    gfx->setTextColor(waterLevelOK ? rgb565(0, 220, 0) : rgb565(255, 60, 60));
+    gfx->setCursor(levelX, levelY + 2);
+    gfx->print(levelLine);
+    dispLast.levelLine = levelLine;
+  }
+
+  if (hsLine != dispLast.hsLine)
+  {
+    clearBox(hsX, hsY, hsW, hsH);
+    gfx->setTextSize(1);
+    gfx->setTextColor(rgb565(220, 220, 220));
+    gfx->setCursor(hsX, hsY + 2);
+    gfx->print(truncateToFit(hsLine, 52));
+    dispLast.hsLine = hsLine;
+  }
+
   if (ssidLine != dispLast.ssidLine)
   {
     clearBox(ssidX, ssidY, ssidW, ssidH);
@@ -878,7 +1034,6 @@ static void drawDisplayDynamicIfNeeded()
     dispLast.ssidLine = ssidLine;
   }
 
-  // IP line
   if (ipLine != dispLast.ipLine)
   {
     clearBox(ipX, ipY, ipW, ipH);
@@ -889,7 +1044,6 @@ static void drawDisplayDynamicIfNeeded()
     dispLast.ipLine = ipLine;
   }
 
-  // Fault banner
   if (f != dispLast.fault || faultLine != dispLast.faultLine)
   {
     gfx->fillRect(0, faultY, W, faultH, BLACK);
@@ -983,23 +1137,26 @@ static String jsonState()
   s += "\"on\":" + String(systemOn ? "true" : "false") + ",";
   s += "\"manual\":" + String(manualActive ? "true" : "false") + ",";
   s += "\"mode\":" + String(profileMode ? "true" : "false") + ",";
-  s += "\"water_ok\":" + String(waterPresent ? "true" : "false") + ",";
   s += "\"water\":" + (isnan(waterTempC) ? String("null") : String(waterTempC, 3)) + ",";
+  s += "\"level\":" + String(waterLevelOK ? "true" : "false") + ",";
   s += "\"target\":" + (isnan(tgt) ? String("null") : String(tgt, 3)) + ",";
   s += "\"tconst\":" + String(targetConstC, 2) + ",";
-  s += "\"ilim\":" + String(currentLimitA, 2) + ",";
   s += "\"maxp\":" + String(maxPowerPercent, 1) + ",";
+  s += "\"pumpen\":" + String(pumpEnabled ? "true" : "false") + ",";
+  s += "\"pumpspd\":" + String(pumpSpeedPercent, 0) + ",";
+  s += "\"pumprpm\":" + String((int)pumpRpm) + ",";
+  s += "\"dispon\":" + String(displayOn ? "true" : "false") + ",";
   s += "\"fault\":" + String(faultTripped ? "true" : "false") + ",";
   s += "\"faultMsg\":\"" + htmlEscape(faultMsg) + "\",";
   s += "\"ip\":\"" + htmlEscape(apMode ? WiFi.softAPIP().toString() : staIP) + "\",";
   s += "\"ssid\":\"" + htmlEscape(apMode ? String(AP_SSID) : staSSID) + "\",";
   s += "\"invert_snippet\":\"" + htmlEscape(invertSnippet()) + "\",";
-  s += "\"curr\":[";
-  for (int i = 0; i < NUM_TEC; i++)
+  s += "\"hs\":[";
+  for (int i = 0; i < NUM_HEATSINK; i++)
   {
     if (i)
       s += ",";
-    s += String(tecCurrentAbsA[i], 3);
+    s += isnan(heatsinkTempC[i]) ? String("null") : String(heatsinkTempC[i], 2);
   }
   s += "],\"duty\":[";
   for (int i = 0; i < NUM_TEC; i++)
@@ -1180,19 +1337,28 @@ static void handleApiControl()
     }
   }
 
+  bool bv;
+  if (jsonBool(b, "pumpen", bv))
+    pumpEnabled = bv;
+  if (jsonBool(b, "dispon", bv))
+  {
+    displayOn = bv;
+    dispDirty = true;
+  }
+
   float f;
   if (jsonFloat(b, "tconst", f))
   {
     targetConstC = clampf(f, -5.0f, 60.0f);
     dispDirty = true;
   }
-  if (jsonFloat(b, "ilim", f))
-  {
-    currentLimitA = clampf(f, 0.0f, 20.0f);
-  }
   if (jsonFloat(b, "maxp", f))
   {
     maxPowerPercent = clampf(f, 0.0f, 100.0f);
+  }
+  if (jsonFloat(b, "pumpspd", f))
+  {
+    pumpSpeedPercent = clampf(f, 0.0f, 100.0f);
   }
 
   saveSettings();
@@ -1252,8 +1418,7 @@ static void handleApiFaultClear()
   {
     faultTripped = false;
     faultMsg = "";
-    for (int i = 0; i < NUM_TEC; i++)
-      overCount[i] = 0;
+    overTempCount = 0;
     dispDirty = true;
   }
   server.send(200, "application/json", jsonState());
@@ -1272,7 +1437,8 @@ static void handleApiTest()
   jsonFloat(b, "duty", duty);
   jsonInt(b, "dur", dur);
 
-  if (!faultTripped)
+  // Refuse a manual TEC test with no coolant flow (dry loop).
+  if (!faultTripped && waterLevelOK)
     startManualTest(chan, heat, duty, (uint32_t)constrain(dur, 1000, 600000));
   server.send(200, "application/json", jsonState());
 }
@@ -1391,7 +1557,7 @@ static void startSTAWeb(const String &ssid, const String &pass)
 static String controlPage()
 {
   String s = pageHeader("TEC Controller");
-  s += "<h2>TEC Controller</h2>";
+  s += "<h2>TEC Bed Cooler</h2>";
 
   s += "<div class='card'><div class='row'>";
 
@@ -1410,16 +1576,27 @@ static String controlPage()
   s += "<div><b>Setpoints</b></div>";
   s += "<label>Mode</label><select id='mode'><option value='0'>Constant</option><option value='1'>Profile</option></select>";
   s += "<label>Const target (C)</label><input id='tconst' type='number' step='0.1'>";
-  s += "<label>Current limit (A)</label><input id='ilim' type='number' step='0.1'>";
   s += "<label>Max power (%)</label><input id='maxp' type='number' step='1'>";
   s += "<div style='margin-top:10px'><button class='btn2' onclick='saveControl()'>Apply</button></div>";
   s += "</div>";
 
   s += "</div></div>";
 
+  // Pump + display settings
+  s += "<div class='card'>";
+  s += "<div><b>Pump &amp; Display</b></div>";
+  s += "<div class='row' style='margin-top:10px'>";
+  s += "<div><label>Pump enabled</label><select id='pumpen'><option value='1'>On</option><option value='0'>Off</option></select></div>";
+  s += "<div><label>Pump speed (%)</label><input id='pumpspd' type='number' step='1' min='0' max='100'></div>";
+  s += "<div><label>Display</label><select id='dispon'><option value='1'>On</option><option value='0'>Off (dark room)</option></select></div>";
+  s += "</div>";
+  s += "<div class='small' style='margin-top:8px'>Pump runs only when the water-level sensor reports FULL. If it reads NEEDS WATER, the pump and TECs are locked off to avoid running the pump dry.</div>";
+  s += "<div style='margin-top:10px'><button class='btn2' onclick='savePumpDisp()'>Apply</button></div>";
+  s += "</div>";
+
   s += "<div class='card'>";
   s += "<div><b>Polarity / Manual TEC Test</b></div>";
-  s += "<div class='small'>Use this to verify each TEC. Then copy/paste the snippet into the code to make it permanent.</div>";
+  s += "<div class='small'>Verify each TEC, then paste the snippet into the code to make polarity permanent. (Requires water level FULL.)</div>";
   s += "<div class='row' style='margin-top:10px'>";
   s += "<div><label>Channel</label><select id='mchan'><option value='0'>TEC1</option><option value='1'>TEC2</option><option value='2'>TEC3</option><option value='3'>TEC4</option></select></div>";
   s += "<div><label>Direction</label><select id='mdir'><option value='0'>COOL</option><option value='1'>HEAT</option></select></div>";
@@ -1467,10 +1644,13 @@ static String controlPage()
   s += "let lines=[];\n";
   s += "lines.push('Power: '+(st.on?'ON':'OFF')+(st.manual?' (MANUAL TEST)':''));\n";
   s += "lines.push('Mode: '+(st.mode?'PROFILE':'CONST'));\n";
-  s += "lines.push('Water: '+(st.water_ok?(st.water.toFixed(2)+' C'):'SENSOR ERR'));\n";
+  s += "lines.push('Water level: '+(st.level?'FULL':'NEEDS WATER'));\n";
+  s += "lines.push('Coolant: '+(isFinite(st.water)?(st.water.toFixed(2)+' C'):'PROBE ERR'));\n";
   s += "lines.push('Target: '+(isFinite(st.target)?st.target.toFixed(2)+' C':'----'));\n";
-  s += "lines.push('I limit: '+st.ilim.toFixed(1)+' A   Max power: '+st.maxp.toFixed(0)+' %');\n";
-  s += "for(let i=0;i<st.curr.length;i++) lines.push('TEC'+(i+1)+': '+st.curr[i].toFixed(2)+' A  duty '+(st.duty[i]*100).toFixed(0)+'%  inv:'+(st.inv[i]?'Y':'N'));\n";
+  s += "lines.push('Max power: '+st.maxp.toFixed(0)+' %');\n";
+  s += "lines.push('Pump: '+(st.pumpen?'EN':'DIS')+' '+st.pumpspd.toFixed(0)+'%  '+st.pumprpm+' rpm');\n";
+  s += "for(let i=0;i<st.hs.length;i++) lines.push('Heatsink'+(i+1)+': '+(st.hs[i]==null?'--':st.hs[i].toFixed(1)+' C'));\n";
+  s += "for(let i=0;i<st.duty.length;i++) lines.push('TEC'+(i+1)+': duty '+(st.duty[i]*100).toFixed(0)+'%  inv:'+(st.inv[i]?'Y':'N'));\n";
   s += "if(st.fault) lines.push('\\nFAULT: '+st.faultMsg);\n";
   s += "return lines.join('\\n');\n";
   s += "}\n";
@@ -1480,15 +1660,20 @@ static String controlPage()
   s += "document.getElementById('net').textContent='IP: '+st.ip+'  SSID: '+st.ssid+'  (try http://tec-ctrl.local/)';\n";
   s += "document.getElementById('mode').value=st.mode?1:0;\n";
   s += "document.getElementById('tconst').value=st.tconst.toFixed(1);\n";
-  s += "document.getElementById('ilim').value=st.ilim.toFixed(1);\n";
   s += "document.getElementById('maxp').value=st.maxp.toFixed(0);\n";
+  s += "document.getElementById('pumpen').value=st.pumpen?1:0;\n";
+  s += "document.getElementById('pumpspd').value=st.pumpspd.toFixed(0);\n";
+  s += "document.getElementById('dispon').value=st.dispon?1:0;\n";
   s += "for(let i=0;i<st.inv.length;i++) document.getElementById('inv'+i).checked=st.inv[i];\n";
   s += "document.getElementById('snip').textContent=st.invert_snippet;\n";
   s += "}\n";
   s += "async function setPower(v){await jpost('/api/control',{on:!!v});refresh();}\n";
   s += "async function clearFault(){await jpost('/api/fault_clear',{});refresh();}\n";
   s += "async function saveControl(){\n";
-  s += "const obj={mode:document.getElementById('mode').value==='1',tconst:parseFloat(tconst.value),ilim:parseFloat(ilim.value),maxp:parseFloat(maxp.value)};\n";
+  s += "const obj={mode:document.getElementById('mode').value==='1',tconst:parseFloat(tconst.value),maxp:parseFloat(maxp.value)};\n";
+  s += "await jpost('/api/control',obj);refresh();}\n";
+  s += "async function savePumpDisp(){\n";
+  s += "const obj={pumpen:document.getElementById('pumpen').value==='1',pumpspd:parseFloat(document.getElementById('pumpspd').value),dispon:document.getElementById('dispon').value==='1'};\n";
   s += "await jpost('/api/control',obj);refresh();}\n";
   s += "async function saveInvert(){\n";
   s += "let inv=[];for(let i=0;i<4;i++) inv.push(!!document.getElementById('inv'+i).checked);\n";
@@ -1515,9 +1700,14 @@ static String controlPage()
 
 static void initTFT()
 {
+  if (TFT_BL != GFX_NOT_DEFINED)
+  {
+    pinMode(TFT_BL, OUTPUT);
+    digitalWrite(TFT_BL, HIGH);
+  }
+
   gfx->begin(TFT_SPI_SPEED);
 
-  // Force a deterministic clean screen immediately.
   gfx->fillScreen(BLACK);
   gfx->setTextWrap(false);
   gfx->setTextColor(WHITE);
@@ -1526,6 +1716,7 @@ static void initTFT()
   gfx->print("Display init OK");
 
   delay(150);
+  applyBacklight(displayOn);
   dispStaticDrawn = false;
   dispDirty = true;
 
@@ -1548,7 +1739,7 @@ void setup()
     digitalWrite(TEC_DIR_PINS[i], COOL_DIR_LEVEL_HIGH ? HIGH : LOW);
   }
 
-  // PWM channels
+  // TEC PWM channels (LEDC 0..3)
   for (int i = 0; i < NUM_TEC; i++)
   {
     double actual = ledcSetup(i, TEC_PWM_FREQ_HZ, TEC_PWM_RES_BITS);
@@ -1558,21 +1749,35 @@ void setup()
     ledcWrite(i, 0);
   }
 
-  // ADC
-  analogReadResolution(12);
-  for (int i = 0; i < NUM_TEC; i++)
-    analogSetPinAttenuation(ACS_ADC_PINS[i], ADC_11db);
+  // Pump PWM (LEDC ch 4) + tach input
+  ledcSetup(PUMP_LEDC_CH, PUMP_PWM_FREQ_HZ, PUMP_PWM_RES_BITS);
+  ledcAttachPin(PUMP_PWM_PIN, PUMP_LEDC_CH);
+  ledcWrite(PUMP_LEDC_CH, 0);
+  pinMode(PUMP_TACH_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(PUMP_TACH_PIN), pumpTachISR, FALLING);
+  lastTachSampleMs = millis();
 
-  // DS18B20
+  // Water level sensor input (pull-down => "no water / off" if disconnected = safe)
+  pinMode(WATER_LEVEL_PIN, INPUT_PULLDOWN);
+
+  // NTC coolant probe ADC
+  analogReadResolution(12);
+  analogSetPinAttenuation(NTC_ADC_PIN, ADC_11db);
+
+  // DS18B20 heatsink sensors
   setupDs18b20();
 
   // TFT
   initTFT();
 
   allTecOff();
+  setPump(0.0f);
   resetPid();
-  calibrateAcsOffsets();
   printInvertSnippetToSerial();
+
+  // Prime water level state
+  serviceWaterLevel();
+  waterLevelOK = waterLevelRawLast;
 
   String ssid, pass;
   bool hasCreds = loadWiFiCreds(ssid, pass);
@@ -1613,14 +1818,11 @@ void loop()
     }
   }
 
-  serviceTemperature();
-
-  static uint32_t lastCurrentMs = 0;
-  if (millis() - lastCurrentMs >= 100)
-  {
-    lastCurrentMs = millis();
-    updateCurrents();
-  }
+  serviceWaterLevel();
+  serviceCoolantTemp();
+  serviceHeatsinkTemps();
+  servicePumpTach();
+  serviceOverTemp();
 
   static uint32_t lastControlMs = 0;
   if (millis() - lastControlMs >= 250)
@@ -1630,6 +1832,7 @@ void loop()
   }
 
   serviceManualTest();
+  servicePump();
   serviceFaultAutoClear();
 
   drawDisplayDynamicIfNeeded();
