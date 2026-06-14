@@ -24,13 +24,13 @@ pio device monitor
 ### Prototype 1 TODO:
 - [x] Test feasibility (concept works, simple to implement)
 - [x] Create a product design mockup
-- [ ] 88/100 Source components
-- [ ] 78/100 Build the thermal engine assembly for the TEC watercooling block
-- [ ] 35/100 Design and build the case for all components that is also protected against water spillage
-- [ ] 26/100 Design and implement an easily refillable 3D printed(?) water reservoir
-- [ ] 15/100 Build mounting box for TEC controllers 
-- [ ] 10/100 Build mount for Arduino controller module
-- [ ] 5/100 Optimize quick connect system for modular accessories
+- [x] Source components
+- [x]  Build the thermal engine assembly for the TEC watercooling block
+- [x]  Design and build the case for all components that is also protected against water spillage
+- [x] Design and implement an easily refillable 3D printed(?) water reservoir
+- [x] Build mounting box for TEC controllers 
+- [x] Build mount for Arduino controller module
+- [x]  Optimize quick connect system for modular accessories
 - [ ] 5/100 Create a prototype cooling pillow
 
 ## First prototype
