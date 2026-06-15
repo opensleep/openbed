@@ -13,6 +13,74 @@ for comm port:
 pio device monitor
 
 
+## Wiring / circuit diagram (ESP32 controller)
+
+The firmware in [`src/main.cpp`](src/main.cpp) targets an `esp32dev` board. All grounds
+must be common: tie the ESP32 GND, the 12 V PSU GND, and every sensor/module GND together.
+
+### Pinout
+
+| Module | Wire / signal | ESP32 GPIO | Notes |
+|---|---|---|---|
+| TEC 1 (Cytron MD13S) | PWM / DIR | 25 / 26 | |
+| TEC 2 (Cytron MD13S) | PWM / DIR | 27 / 14 | |
+| TEC 3 (Cytron MD13S) | PWM / DIR | 32 / 33 | |
+| TEC 4 (Cytron MD13S) | PWM / DIR | 16 / 17 | |
+| Heatsink temp ×2 (DS18B20) | DATA | 13 | both share the bus; one 4.7 kΩ pull-up DATA→3.3 V; VCC→3.3 V |
+| Coolant probe (2-wire 10 kΩ NTC, on pump block) | divider node | 34 (ADC) | needs one 10 kΩ fixed resistor — see diagram |
+| D5 pump | Red / Black | — | +12 V / GND (12 V PSU) |
+| D5 pump | Blue (PWM) | 19 | 25 kHz control |
+| D5 pump | Green (tach) | 22 | speed feedback (internal pull-up) |
+| Water level (XKC-Y26, 5 V) | Brown / Blue | — | VCC 5 V / GND |
+| Water level (XKC-Y26, 5 V) | Yellow (OUT) | 21 | 5 V output → needs divider — see diagram |
+| Water level (XKC-Y26, 5 V) | Black (MODE) | — | leave floating = normally-open (HIGH when water present) |
+| TFT ST7789 | SCK / MOSI(SDA) / DC | 18 / 23 / 4 | |
+| TFT ST7789 | BL / BLK | 15 | backlight control (display off for dark room) |
+| TFT ST7789 | CS→GND, RST→3.3 V, VCC→3.3 V | — | |
+
+> **Software water-level override:** ships **ON** by default so the rig can run before the
+> 5 V sensor is wired. It bypasses the dry-run interlock — turn it OFF in the web menu once
+> the sensor is connected. Don't leave the pump powered without coolant while override is ON.
+
+### Coolant NTC thermistor (2-wire) — divider
+
+A bare NTC only changes resistance, so it's paired with one fixed 10 kΩ resistor to make a
+voltage divider the ESP32 can read. Power it from **3.3 V (not 5 V)**:
+
+```text
+  3.3V ──[ 10kΩ NTC probe ]──┬──[ 10kΩ fixed resistor ]── GND
+                             │
+                          GPIO34 (ADC)
+```
+
+NTC leads are not polarised. If readings are inverted, the NTC and fixed resistor are
+swapped. Constants (`NTC_R_FIXED`, `NTC_R0`, `NTC_BETA`) live near the top of `main.cpp`.
+
+### XKC-Y26 water-level sensor (5 V) — output divider
+
+The OUT line swings to 5 V, which exceeds the ESP32's 3.3 V limit, so divide it down:
+
+```text
+  Brown ── 5V
+  Blue  ── GND
+  Black ── (leave floating = normally open)
+  Yellow (OUT) ──[ 10kΩ ]──┬──[ 20kΩ ]── GND     (≈3.3 V at the node)
+                           │
+                        GPIO21
+```
+
+If your unit reads inverted, short Black→Blue or flip `WATER_LEVEL_ACTIVE_HIGH` in the code.
+
+### Pump dry-run interlock
+
+```text
+  water level OK (or override) ──┐
+                                 ├─► pump PWM enabled  +  TECs allowed to run
+  system ON / no fault ──────────┘
+  otherwise → pump OFF and TECs OFF (prevents running the D5 dry)
+```
+
+
 **OpenBed/OpenCooler/Pod (haven't decided on a final name) will be hot swappable with several potential accessories:**
 1. A pet cooler pad in large (dog) and small (cat/other) sizes to give your animal the best sleep possible
 2. A pillow cover for a standard sized pillow

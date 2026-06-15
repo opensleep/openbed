@@ -165,9 +165,12 @@ static const uint16_t tempConvDelayMs = 200; // 10-bit ~187ms
 static float waterTempC = NAN; // regulated coolant temp from the pump-block NTC
 
 // Water level
-static bool waterLevelOK = false;
+static bool waterLevelOK = false; // debounced reading from the XKC-Y26 sensor
 static bool waterLevelRawLast = false;
 static uint32_t waterLevelChangeMs = 0;
+// Software override: force the interlock to "water present" for bench testing
+// (e.g. when the 5V sensor isn't powered yet). Defaults ON for testing.
+static bool waterLevelOverride = true;
 
 // Pump
 static float pumpDutyApplied = 0.0f;
@@ -349,6 +352,7 @@ static void loadSettings()
   pumpEnabled = prefs.getBool("pumpen", true);
   pumpSpeedPercent = prefs.getFloat("pumpspd", DEFAULT_PUMP_SPEED_PERCENT);
   displayOn = prefs.getBool("dispon", true);
+  waterLevelOverride = prefs.getBool("wlovr", true);
 
   for (int i = 0; i < NUM_TEC; i++)
     dirInvert[i] = TEC_DIR_INVERT_DEFAULT[i];
@@ -392,6 +396,7 @@ static void saveSettings()
   prefs.putBool("pumpen", pumpEnabled);
   prefs.putFloat("pumpspd", pumpSpeedPercent);
   prefs.putBool("dispon", displayOn);
+  prefs.putBool("wlovr", waterLevelOverride);
 
   for (int i = 0; i < NUM_TEC; i++)
   {
@@ -583,6 +588,13 @@ static void serviceWaterLevel()
   }
 }
 
+// Effective interlock used by the pump/TEC logic. The override forces "water
+// present" so the rig can run on the bench before the 5V sensor is wired.
+static inline bool waterAvailable()
+{
+  return waterLevelOverride || waterLevelOK;
+}
+
 // ======================= HEATSINK OVER-TEMP SAFETY =======================
 
 static void serviceOverTemp()
@@ -685,7 +697,7 @@ static void setPump(float duty01)
 // active AND there is water AND no fault.
 static void servicePump()
 {
-  bool wantPump = pumpEnabled && waterLevelOK && !faultTripped && (systemOn || manualActive);
+  bool wantPump = pumpEnabled && waterAvailable() && !faultTripped && (systemOn || manualActive);
   setPump(wantPump ? (pumpSpeedPercent / 100.0f) : 0.0f);
 }
 
@@ -738,7 +750,7 @@ static float computeProfileTarget(float &posHoursOut)
 static void updateControl()
 {
   // TECs must never run without coolant flow: require water level OK.
-  if (faultTripped || !systemOn || !waterLevelOK || isnan(waterTempC) || manualActive)
+  if (faultTripped || !systemOn || !waterAvailable() || isnan(waterTempC) || manualActive)
   {
     if (!manualActive)
       allTecOff();
@@ -803,7 +815,7 @@ static void serviceManualTest()
     return;
 
   // Stop the test on a fault or if the loop runs dry (TECs would overheat).
-  if (faultTripped || !waterLevelOK)
+  if (faultTripped || !waterAvailable())
   {
     manualActive = false;
     allTecOff();
@@ -955,7 +967,11 @@ static void drawDisplayDynamicIfNeeded()
   }
   String targetLine = String(tgt, 2) + "C";
 
-  String levelLine = waterLevelOK ? "LEVEL: FULL" : "LEVEL: NEEDS WATER";
+  String levelLine;
+  if (waterLevelOverride)
+    levelLine = String("LEVEL: OVERRIDE (sns:") + (waterLevelOK ? "FULL)" : "LOW)");
+  else
+    levelLine = waterLevelOK ? "LEVEL: FULL" : "LEVEL: NEEDS WATER";
 
   String hsLine = "HS ";
   for (int i = 0; i < NUM_HEATSINK; i++)
@@ -1008,7 +1024,11 @@ static void drawDisplayDynamicIfNeeded()
   {
     clearBox(levelX, levelY, levelW, levelH);
     gfx->setTextSize(1);
-    gfx->setTextColor(waterLevelOK ? rgb565(0, 220, 0) : rgb565(255, 60, 60));
+    // amber = override active, green = sensor reports full, red = needs water
+    uint16_t lvlColor = waterLevelOverride ? rgb565(255, 180, 0)
+                        : waterLevelOK     ? rgb565(0, 220, 0)
+                                           : rgb565(255, 60, 60);
+    gfx->setTextColor(lvlColor);
     gfx->setCursor(levelX, levelY + 2);
     gfx->print(levelLine);
     dispLast.levelLine = levelLine;
@@ -1139,6 +1159,7 @@ static String jsonState()
   s += "\"mode\":" + String(profileMode ? "true" : "false") + ",";
   s += "\"water\":" + (isnan(waterTempC) ? String("null") : String(waterTempC, 3)) + ",";
   s += "\"level\":" + String(waterLevelOK ? "true" : "false") + ",";
+  s += "\"level_ovr\":" + String(waterLevelOverride ? "true" : "false") + ",";
   s += "\"target\":" + (isnan(tgt) ? String("null") : String(tgt, 3)) + ",";
   s += "\"tconst\":" + String(targetConstC, 2) + ",";
   s += "\"maxp\":" + String(maxPowerPercent, 1) + ",";
@@ -1345,6 +1366,11 @@ static void handleApiControl()
     displayOn = bv;
     dispDirty = true;
   }
+  if (jsonBool(b, "wlovr", bv))
+  {
+    waterLevelOverride = bv;
+    dispDirty = true;
+  }
 
   float f;
   if (jsonFloat(b, "tconst", f))
@@ -1438,7 +1464,7 @@ static void handleApiTest()
   jsonInt(b, "dur", dur);
 
   // Refuse a manual TEC test with no coolant flow (dry loop).
-  if (!faultTripped && waterLevelOK)
+  if (!faultTripped && waterAvailable())
     startManualTest(chan, heat, duty, (uint32_t)constrain(dur, 1000, 600000));
   server.send(200, "application/json", jsonState());
 }
@@ -1589,8 +1615,9 @@ static String controlPage()
   s += "<div><label>Pump enabled</label><select id='pumpen'><option value='1'>On</option><option value='0'>Off</option></select></div>";
   s += "<div><label>Pump speed (%)</label><input id='pumpspd' type='number' step='1' min='0' max='100'></div>";
   s += "<div><label>Display</label><select id='dispon'><option value='1'>On</option><option value='0'>Off (dark room)</option></select></div>";
+  s += "<div><label>Water-level override</label><select id='wlovr'><option value='1'>ON (bypass sensor)</option><option value='0'>OFF (use sensor)</option></select></div>";
   s += "</div>";
-  s += "<div class='small' style='margin-top:8px'>Pump runs only when the water-level sensor reports FULL. If it reads NEEDS WATER, the pump and TECs are locked off to avoid running the pump dry.</div>";
+  s += "<div class='small' style='margin-top:8px'>Pump runs only when the loop is full. With override OFF this comes from the water-level sensor; with override ON the interlock is bypassed for bench testing (sensor reading still shown). Turn override OFF once the 5V sensor is wired.</div>";
   s += "<div style='margin-top:10px'><button class='btn2' onclick='savePumpDisp()'>Apply</button></div>";
   s += "</div>";
 
@@ -1644,7 +1671,7 @@ static String controlPage()
   s += "let lines=[];\n";
   s += "lines.push('Power: '+(st.on?'ON':'OFF')+(st.manual?' (MANUAL TEST)':''));\n";
   s += "lines.push('Mode: '+(st.mode?'PROFILE':'CONST'));\n";
-  s += "lines.push('Water level: '+(st.level?'FULL':'NEEDS WATER'));\n";
+  s += "lines.push('Water level: sensor='+(st.level?'FULL':'LOW')+(st.level_ovr?'  [OVERRIDE ON]':''));\n";
   s += "lines.push('Coolant: '+(isFinite(st.water)?(st.water.toFixed(2)+' C'):'PROBE ERR'));\n";
   s += "lines.push('Target: '+(isFinite(st.target)?st.target.toFixed(2)+' C':'----'));\n";
   s += "lines.push('Max power: '+st.maxp.toFixed(0)+' %');\n";
@@ -1664,6 +1691,7 @@ static String controlPage()
   s += "document.getElementById('pumpen').value=st.pumpen?1:0;\n";
   s += "document.getElementById('pumpspd').value=st.pumpspd.toFixed(0);\n";
   s += "document.getElementById('dispon').value=st.dispon?1:0;\n";
+  s += "document.getElementById('wlovr').value=st.level_ovr?1:0;\n";
   s += "for(let i=0;i<st.inv.length;i++) document.getElementById('inv'+i).checked=st.inv[i];\n";
   s += "document.getElementById('snip').textContent=st.invert_snippet;\n";
   s += "}\n";
@@ -1673,7 +1701,7 @@ static String controlPage()
   s += "const obj={mode:document.getElementById('mode').value==='1',tconst:parseFloat(tconst.value),maxp:parseFloat(maxp.value)};\n";
   s += "await jpost('/api/control',obj);refresh();}\n";
   s += "async function savePumpDisp(){\n";
-  s += "const obj={pumpen:document.getElementById('pumpen').value==='1',pumpspd:parseFloat(document.getElementById('pumpspd').value),dispon:document.getElementById('dispon').value==='1'};\n";
+  s += "const obj={pumpen:document.getElementById('pumpen').value==='1',pumpspd:parseFloat(document.getElementById('pumpspd').value),dispon:document.getElementById('dispon').value==='1',wlovr:document.getElementById('wlovr').value==='1'};\n";
   s += "await jpost('/api/control',obj);refresh();}\n";
   s += "async function saveInvert(){\n";
   s += "let inv=[];for(let i=0;i<4;i++) inv.push(!!document.getElementById('inv'+i).checked);\n";
