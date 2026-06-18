@@ -12,6 +12,18 @@ pio run -t upload
 for comm port:
 pio device monitor
 
+## Flashing versions
+
+Start to connecting... then hold the boot button. Then click EN once and let go of both buttons. It will appear to freeze for a moment. Then it will say: 
+Writing at 0x000db0b4... (91 %)
+Writing at 0x000e0351... (94 %)
+Writing at 0x000e5dcf... (97 %)
+Writing at 0x000eb3b0... (100 %)
+Wrote 916464 bytes (586341 compressed) at 0x00010000 in 9.7 seconds (effective 752.6 kbit/s)...
+Hash of data verified.
+
+Leaving...
+Hard resetting via RTS pin...
 
 ## Wiring / circuit diagram (ESP32 controller)
 
@@ -35,7 +47,7 @@ must be common: tie the ESP32 GND, the 12 V PSU GND, and every sensor/module GND
 | Water level (XKC-Y26, 5 V) | Yellow (OUT) | 21 | 5 V output → needs divider — see diagram |
 | Water level (XKC-Y26, 5 V) | Black (MODE) | — | leave floating = normally-open (HIGH when water present) |
 | TFT ST7789 | SCK / MOSI(SDA) / DC | 18 / 23 / 4 | |
-| TFT ST7789 | BL / BLK | 15 | backlight control (display off for dark room) |
+| TFT ST7789 | BL / BLK | 5 | backlight control (display off for dark room); avoid GPIO15 — strapping pin |
 | TFT ST7789 | CS→GND, RST→3.3 V, VCC→3.3 V | — | |
 
 > **Software water-level override:** ships **ON** by default so the rig can run before the
@@ -78,6 +90,49 @@ If your unit reads inverted, short Black→Blue or flip `WATER_LEVEL_ACTIVE_HIGH
                                  ├─► pump PWM enabled  +  TECs allowed to run
   system ON / no fault ──────────┘
   otherwise → pump OFF and TECs OFF (prevents running the D5 dry)
+```
+
+## Web interface & HTTP API
+
+### Connecting
+
+- **First boot / no saved WiFi:** the device starts an open access point `TEC-CTRL-SETUP`
+  at `http://192.168.4.1`. Join it and enter your **2.4 GHz** WiFi credentials, then it reboots.
+- **After setup:** browse to `http://tec-ctrl.local/` (or the IP shown on the TFT / serial log).
+  Your device and the ESP32 must be on the same network. The `TEC-CTRL-SETUP` hotspot only
+  reappears if it has no creds or can't connect.
+
+### API
+
+The controller *is* the API server — the built-in page is just a thin client. All endpoints
+return the full state object as JSON, so anyone can build their own web or mobile client.
+**CORS is enabled** (`Access-Control-Allow-Origin: *`), so a separately hosted app can call
+these directly. Safety logic (dry-run interlock, heatsink over-temp, PID) always runs on the
+device — external apps are clients only and are never in the control loop.
+
+| Method | Path | Body (JSON) | Purpose |
+|---|---|---|---|
+| GET | `/api/state` | — | Full live state (see fields below) |
+| POST | `/api/control` | any of `on`,`mode`,`tconst`,`maxp`,`pumpen`,`pumpspd`,`dispon`,`wlovr` | Power, setpoints, pump, display, water-level override |
+| POST | `/api/invert` | `{"inv":[bool,bool,bool,bool]}` | Per-TEC direction invert |
+| POST | `/api/profile` | `{"hour":0-23,"temp":C}` | Set one hourly profile point |
+| POST | `/api/test` | `{"duty":[0-1 ×4],"heat":[bool ×4],"dur":ms}` (or single-channel `{"chan":0-3,"heat":bool,"duty":0-1,"dur":ms}`) | Manual TEC test (needs water/override). Per-channel form runs any mix of TECs at once, each at its own duty (0 = off) and direction, for the shared duration. Every duty is clamped to `maxp`. |
+| POST | `/api/test_stop` | — | Stop manual test |
+| POST | `/api/fault_clear` | — | Clear a latched fault (only while OFF) |
+
+Key `/api/state` fields: `on`, `manual`, `mode` (false=constant/true=profile), `water` (coolant
+°C or null), `level` (sensor bool), `level_ovr` (override bool), `target`, `tconst`, `maxp`,
+`pumpen`, `pumpspd`, `pumprpm`, `dispon`, `fault`, `faultMsg`, `ip`, `ssid`, `hs_count`,
+`hs[]` (heatsink °C, null if absent), `duty[]`, `inv[]`.
+
+Examples:
+
+```bash
+curl http://tec-ctrl.local/api/state
+curl -X POST http://tec-ctrl.local/api/control -H "Content-Type: application/json" \
+     -d '{"on":true,"tconst":18.5}'
+curl -X POST http://tec-ctrl.local/api/control -H "Content-Type: application/json" \
+     -d '{"pumpen":true,"pumpspd":40,"wlovr":false}'
 ```
 
 

@@ -43,8 +43,11 @@ static const int NUM_HEATSINK = 2; // DS18B20 sensors glued to the heatsinks
 static const int TEC_PWM_PINS[NUM_TEC] = {25, 27, 32, 16};
 static const int TEC_DIR_PINS[NUM_TEC] = {26, 14, 33, 17};
 
-// DS18B20 OneWire bus (now carries the 2 heatsink sensors)
-static const int ONE_WIRE_PIN = 13;
+// DS18B20 heatsink sensors — each probe on its OWN dedicated OneWire bus/pin,
+// so a flaky or mis-powered probe on one bus can't disturb the other. Each bus
+// still needs its own 4.7k pull-up (DATA -> 3V3). GPIO15 is a strapping pin but
+// its boot-default is HIGH, which is compatible with the pull-up.
+static const int ONE_WIRE_PINS[NUM_HEATSINK] = {13, 15};
 
 // Coolant temperature probe: 2-wire NTC thermistor on the pump block.
 // Wiring of the divider:  3.3V --- NTC --- [ADC node] --- R_FIXED --- GND
@@ -67,7 +70,9 @@ static const int TFT_DC = 4;
 
 // TFT backlight control (drives the BLK/BL pin). Lets us fully blank the panel
 // for a dark room. Set to GFX_NOT_DEFINED if BL is hard-wired to 3V3.
-static const int TFT_BL = 15;
+// NOTE: GPIO15 is a boot strapping/JTAG pin and caused faint flicker when used
+// for the backlight — use GPIO5 instead (free, safe as a normal output).
+static const int TFT_BL = 5;
 
 // If CS is tied to GND, keep GFX_NOT_DEFINED.
 static const int TFT_CS = GFX_NOT_DEFINED;
@@ -148,10 +153,15 @@ Arduino_GFX *gfx = new Arduino_ST7789(
     TFT_COL_OFFSET_1, TFT_ROW_OFFSET_1,
     TFT_COL_OFFSET_2, TFT_ROW_OFFSET_2);
 
-// DS18B20 (heatsinks)
-OneWire oneWire(ONE_WIRE_PIN);
-DallasTemperature ds18b20(&oneWire);
+// DS18B20 (heatsinks) — one sensor per dedicated bus.
+static_assert(NUM_HEATSINK == 2, "per-bus DS18B20 wiring assumes exactly 2 sensors");
+OneWire oneWire0(ONE_WIRE_PINS[0]);
+OneWire oneWire1(ONE_WIRE_PINS[1]);
+DallasTemperature dsBus0(&oneWire0);
+DallasTemperature dsBus1(&oneWire1);
+static DallasTemperature *const dsBus[NUM_HEATSINK] = {&dsBus0, &dsBus1};
 static DeviceAddress hsAddr[NUM_HEATSINK];
+static bool hsPresent[NUM_HEATSINK] = {false, false};
 static int hsCount = 0;
 static float heatsinkTempC[NUM_HEATSINK] = {NAN, NAN};
 
@@ -159,7 +169,7 @@ static float heatsinkTempC[NUM_HEATSINK] = {NAN, NAN};
 static bool tempConvInFlight = false;
 static uint32_t tempConvStartMs = 0;
 static uint32_t lastTempKickMs = 0;
-static const uint16_t tempConvDelayMs = 200; // 10-bit ~187ms
+static const uint16_t tempConvDelayMs = 200; // 10-bit conversion ~187ms
 
 // Coolant (NTC) temperature
 static float waterTempC = NAN; // regulated coolant temp from the pump-block NTC
@@ -229,12 +239,12 @@ static bool faultTripped = false;
 static String faultMsg;
 static uint8_t overTempCount = 0;
 
-// Manual test
+// Manual test — any mix of channels can run at once, each at its own duty/
+// direction, for one shared duration. Duty 0 means that channel stays off.
 static bool manualActive = false;
 static uint32_t manualEndMs = 0;
-static int manualChan = 0;
-static bool manualHeat = false;
-static float manualDuty = 0.0f;
+static float manualChanDuty[NUM_TEC] = {0};
+static bool manualChanHeat[NUM_TEC] = {false};
 
 // Display caching
 struct DispCache
@@ -445,40 +455,47 @@ static void printDeviceAddress(const DeviceAddress &addr)
 
 static void setupDs18b20()
 {
-  pinMode(ONE_WIRE_PIN, INPUT_PULLUP);
-  delay(5);
-
-  Serial.printf("GPIO%d idle level (expect 1): %d\n", ONE_WIRE_PIN, digitalRead(ONE_WIRE_PIN));
-
-  ds18b20.begin();
-  int count = ds18b20.getDeviceCount();
-  Serial.printf("DS18B20 device count: %d\n", count);
-
   hsCount = 0;
-  for (int i = 0; i < NUM_HEATSINK && i < count; i++)
+
+  for (int b = 0; b < NUM_HEATSINK; b++)
   {
-    if (ds18b20.getAddress(hsAddr[i], i))
+    int pin = ONE_WIRE_PINS[b];
+    pinMode(pin, INPUT_PULLUP);
+    delay(5);
+    Serial.printf("Bus %d GPIO%d idle level (expect 1): %d\n", b, pin, digitalRead(pin));
+
+    dsBus[b]->begin();
+    int count = dsBus[b]->getDeviceCount();
+    Serial.printf("Bus %d DS18B20 count: %d  parasite: %s\n", b, count,
+                  dsBus[b]->isParasitePowerMode() ? "YES (check VDD wiring!)" : "no");
+
+    hsPresent[b] = false;
+    heatsinkTempC[b] = NAN;
+
+    if (count > 0 && dsBus[b]->getAddress(hsAddr[b], 0))
     {
-      Serial.printf("DS18B20[%d] addr: ", i);
-      printDeviceAddress(hsAddr[i]);
+      Serial.printf("Bus %d DS18B20 addr: ", b);
+      printDeviceAddress(hsAddr[b]);
       Serial.println();
-      ds18b20.setResolution(hsAddr[i], 10);
+      dsBus[b]->setResolution(hsAddr[b], 10);
+      dsBus[b]->setWaitForConversion(false);
+      hsPresent[b] = true;
       hsCount++;
+    }
+    else
+    {
+      Serial.printf("Bus %d: no DS18B20 detected. Check wiring + 4.7k pull-up DATA->3V3.\n", b);
     }
   }
 
-  ds18b20.setWaitForConversion(false);
-
   if (hsCount > 0)
   {
-    ds18b20.requestTemperatures();
+    for (int b = 0; b < NUM_HEATSINK; b++)
+      if (hsPresent[b])
+        dsBus[b]->requestTemperatures();
     tempConvStartMs = millis();
     tempConvInFlight = true;
     lastTempKickMs = millis();
-  }
-  else
-  {
-    Serial.println("No heatsink DS18B20 detected. Check wiring + pull-up DATA->3V3.");
   }
 }
 
@@ -493,7 +510,9 @@ static void serviceHeatsinkTemps()
   {
     if ((now - lastTempKickMs) >= 1000)
     {
-      ds18b20.requestTemperatures();
+      for (int b = 0; b < NUM_HEATSINK; b++)
+        if (hsPresent[b])
+          dsBus[b]->requestTemperatures();
       tempConvStartMs = now;
       tempConvInFlight = true;
     }
@@ -505,14 +524,17 @@ static void serviceHeatsinkTemps()
     lastTempKickMs = now;
     tempConvInFlight = false;
 
-    for (int i = 0; i < hsCount; i++)
+    for (int b = 0; b < NUM_HEATSINK; b++)
     {
-      float t = ds18b20.getTempC(hsAddr[i]);
+      if (!hsPresent[b])
+        continue;
+
+      float t = dsBus[b]->getTempC(hsAddr[b]);
       float newTemp = (t == DEVICE_DISCONNECTED_C) ? NAN : t;
-      if ((isnan(newTemp) != isnan(heatsinkTempC[i])) ||
-          (!isnan(newTemp) && fabsf(newTemp - heatsinkTempC[i]) > 0.1f))
+      if ((isnan(newTemp) != isnan(heatsinkTempC[b])) ||
+          (!isnan(newTemp) && fabsf(newTemp - heatsinkTempC[b]) > 0.1f))
       {
-        heatsinkTempC[i] = newTemp;
+        heatsinkTempC[b] = newTemp;
         dispDirty = true;
       }
     }
@@ -522,7 +544,7 @@ static void serviceHeatsinkTemps()
 static float maxHeatsinkC()
 {
   float m = NAN;
-  for (int i = 0; i < hsCount; i++)
+  for (int i = 0; i < NUM_HEATSINK; i++)
   {
     if (!isnan(heatsinkTempC[i]))
     {
@@ -791,15 +813,21 @@ static void updateControl()
 
 // ======================= MANUAL TEST =======================
 
-static void startManualTest(int chan, bool heat, float duty, uint32_t durationMs)
+// Start a manual test with a per-channel duty/direction. Any combination of
+// channels can run together; duty 0 leaves that channel off. Each duty is
+// clamped to the same Max-power limit the PID uses, so the test can never push
+// a channel past the configured cap (set Max power, ask for 100% here, and the
+// applied duty in /api/state reads back the cap).
+static void startManualTest(const float duty[NUM_TEC], const bool heat[NUM_TEC], uint32_t durationMs)
 {
-  chan = constrain(chan, 0, NUM_TEC - 1);
-  duty = clampf(duty, 0.0f, 1.0f);
+  float cap = maxPowerPercent / 100.0f;
+  for (int i = 0; i < NUM_TEC; i++)
+  {
+    manualChanDuty[i] = clampf(duty[i], 0.0f, cap);
+    manualChanHeat[i] = heat[i];
+  }
 
   manualActive = true;
-  manualChan = chan;
-  manualHeat = heat;
-  manualDuty = duty;
   manualEndMs = millis() + durationMs;
 
   systemOn = false;
@@ -833,12 +861,7 @@ static void serviceManualTest()
   }
 
   for (int i = 0; i < NUM_TEC; i++)
-  {
-    if (i == manualChan)
-      setTecOutput(i, manualHeat, manualDuty);
-    else
-      setTecOutput(i, false, 0.0f);
-  }
+    setTecOutput(i, manualChanHeat[i], manualChanDuty[i]);
 }
 
 // ======================= DISPLAY =======================
@@ -1172,6 +1195,7 @@ static String jsonState()
   s += "\"ip\":\"" + htmlEscape(apMode ? WiFi.softAPIP().toString() : staIP) + "\",";
   s += "\"ssid\":\"" + htmlEscape(apMode ? String(AP_SSID) : staSSID) + "\",";
   s += "\"invert_snippet\":\"" + htmlEscape(invertSnippet()) + "\",";
+  s += "\"hs_count\":" + String(hsCount) + ",";
   s += "\"hs\":[";
   for (int i = 0; i < NUM_HEATSINK; i++)
   {
@@ -1251,9 +1275,12 @@ static bool jsonInt(const String &b, const char *key, int &out)
   out = (int)lroundf(f);
   return true;
 }
-static bool jsonInvArray(const String &b, bool outArr[NUM_TEC])
+// Parse a JSON bool array under `key` into outArr[NUM_TEC]. Returns true only
+// if exactly NUM_TEC valid booleans were read.
+static bool jsonBoolArray(const String &b, const char *key, bool outArr[NUM_TEC])
 {
-  int p = b.indexOf("\"inv\"");
+  String k = String("\"") + key + "\"";
+  int p = b.indexOf(k);
   if (p < 0)
     return false;
   p = b.indexOf("[", p);
@@ -1285,6 +1312,45 @@ static bool jsonInvArray(const String &b, bool outArr[NUM_TEC])
     start = comma + 1;
   }
   return (idx == NUM_TEC);
+}
+
+static bool jsonInvArray(const String &b, bool outArr[NUM_TEC])
+{
+  return jsonBoolArray(b, "inv", outArr);
+}
+
+// Parse a JSON float array under `key` into outArr[NUM_TEC]. Entries not
+// present default to 0. Returns the number of values parsed (<=0 if the key or
+// its array is absent), so callers can distinguish "array form" from "scalar".
+static int jsonFloatArray(const String &b, const char *key, float outArr[NUM_TEC])
+{
+  String k = String("\"") + key + "\"";
+  int p = b.indexOf(k);
+  if (p < 0)
+    return -1;
+  p = b.indexOf("[", p);
+  if (p < 0)
+    return -1;
+  int q = b.indexOf("]", p);
+  if (q < 0)
+    return -1;
+  String inside = b.substring(p + 1, q);
+
+  int idx = 0;
+  int start = 0;
+  while (idx < NUM_TEC)
+  {
+    int comma = inside.indexOf(",", start);
+    String tok = (comma < 0) ? inside.substring(start) : inside.substring(start, comma);
+    tok.trim();
+    if (tok.length() > 0)
+      outArr[idx] = tok.toFloat();
+    idx++;
+    if (comma < 0)
+      break;
+    start = comma + 1;
+  }
+  return idx;
 }
 
 // ======================= WEB HANDLERS =======================
@@ -1453,19 +1519,35 @@ static void handleApiFaultClear()
 static void handleApiTest()
 {
   String b = bodyText();
-  int chan = 0;
-  bool heat = false;
-  float duty = 0.2f;
   int dur = 10000;
-
-  jsonInt(b, "chan", chan);
-  jsonBool(b, "heat", heat);
-  jsonFloat(b, "duty", duty);
   jsonInt(b, "dur", dur);
+
+  float duty[NUM_TEC] = {0};
+  bool heat[NUM_TEC] = {false};
+
+  // Per-channel form: {"duty":[...],"heat":[...],"dur":ms} — any mix of
+  // channels at once, duty 0 = off, heat[] optional (defaults all COOL).
+  if (jsonFloatArray(b, "duty", duty) > 0)
+  {
+    jsonBoolArray(b, "heat", heat);
+  }
+  else
+  {
+    // Back-compat single-channel form: {"chan":0-3,"heat":bool,"duty":0-1}.
+    int chan = 0;
+    bool h = false;
+    float d = 0.2f;
+    jsonInt(b, "chan", chan);
+    jsonBool(b, "heat", h);
+    jsonFloat(b, "duty", d);
+    chan = constrain(chan, 0, NUM_TEC - 1);
+    duty[chan] = d;
+    heat[chan] = h;
+  }
 
   // Refuse a manual TEC test with no coolant flow (dry loop).
   if (!faultTripped && waterAvailable())
-    startManualTest(chan, heat, duty, (uint32_t)constrain(dur, 1000, 600000));
+    startManualTest(duty, heat, (uint32_t)constrain(dur, 1000, 600000));
   server.send(200, "application/json", jsonState());
 }
 
@@ -1480,6 +1562,14 @@ static void handleApiTestStop()
 
 static void handleNotFound()
 {
+  // CORS preflight: let browser-based apps hosted elsewhere POST JSON to us.
+  if (server.method() == HTTP_OPTIONS)
+  {
+    server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+    server.send(204);
+    return;
+  }
   if (apMode)
   {
     server.sendHeader("Location", "/wifi", true);
@@ -1491,6 +1581,11 @@ static void handleNotFound()
 
 static void setupWebServer()
 {
+  // Adds "Access-Control-Allow-Origin: *" to every response so separately
+  // hosted web/mobile apps can call the JSON API. Preflight OPTIONS requests
+  // are answered in handleNotFound().
+  server.enableCORS(true);
+
   server.on("/", HTTP_GET, handleRoot);
 
   server.on("/wifi", HTTP_GET, handleWiFiPage);
@@ -1623,12 +1718,16 @@ static String controlPage()
 
   s += "<div class='card'>";
   s += "<div><b>Polarity / Manual TEC Test</b></div>";
-  s += "<div class='small'>Verify each TEC, then paste the snippet into the code to make polarity permanent. (Requires water level FULL.)</div>";
+  s += "<div class='small'>Set a duty per TEC (0 = off) and a direction, then Start. Any mix of channels runs together for the duration. Each duty is clamped to <b>Max power</b> above. (Requires water level FULL.)</div>";
+  s += "<div class='small' style='color:#b30'>Watch the PSU: running several at once shares the 12&nbsp;V rail with the fans + pump. Keep the combined load within the supply (≈50% across all four on a 41&nbsp;A PSU).</div>";
   s += "<div class='row' style='margin-top:10px'>";
-  s += "<div><label>Channel</label><select id='mchan'><option value='0'>TEC1</option><option value='1'>TEC2</option><option value='2'>TEC3</option><option value='3'>TEC4</option></select></div>";
-  s += "<div><label>Direction</label><select id='mdir'><option value='0'>COOL</option><option value='1'>HEAT</option></select></div>";
-  s += "<div><label>Duty (%)</label><input id='mduty' type='number' value='20' step='1'></div>";
-  s += "<div><label>Duration (s)</label><input id='mdur' type='number' value='10' step='1'></div>";
+  for (int i = 0; i < NUM_TEC; i++)
+  {
+    s += "<div><label>TEC" + String(i + 1) + " duty %</label>";
+    s += "<input id='mduty" + String(i) + "' type='number' value='0' step='1' min='0' max='100' style='width:70px'>";
+    s += "<select id='mdir" + String(i) + "'><option value='0'>COOL</option><option value='1'>HEAT</option></select></div>";
+  }
+  s += "<div><label>Duration (s)</label><input id='mdur' type='number' value='10' step='1' style='width:80px'></div>";
   s += "</div>";
   s += "<div class='row' style='margin-top:10px'>";
   s += "<button class='btn2' onclick='startTest()'>Start Test</button>";
@@ -1676,15 +1775,14 @@ static String controlPage()
   s += "lines.push('Target: '+(isFinite(st.target)?st.target.toFixed(2)+' C':'----'));\n";
   s += "lines.push('Max power: '+st.maxp.toFixed(0)+' %');\n";
   s += "lines.push('Pump: '+(st.pumpen?'EN':'DIS')+' '+st.pumpspd.toFixed(0)+'%  '+st.pumprpm+' rpm');\n";
+  s += "lines.push('Heatsinks detected: '+st.hs_count+' of '+st.hs.length);\n";
   s += "for(let i=0;i<st.hs.length;i++) lines.push('Heatsink'+(i+1)+': '+(st.hs[i]==null?'--':st.hs[i].toFixed(1)+' C'));\n";
   s += "for(let i=0;i<st.duty.length;i++) lines.push('TEC'+(i+1)+': duty '+(st.duty[i]*100).toFixed(0)+'%  inv:'+(st.inv[i]?'Y':'N'));\n";
   s += "if(st.fault) lines.push('\\nFAULT: '+st.faultMsg);\n";
   s += "return lines.join('\\n');\n";
   s += "}\n";
-  s += "async function refresh(){\n";
-  s += "const st=await jget('/api/state');\n";
-  s += "document.getElementById('status').textContent=fmtState(st);\n";
-  s += "document.getElementById('net').textContent='IP: '+st.ip+'  SSID: '+st.ssid+'  (try http://tec-ctrl.local/)';\n";
+  s += "let formInit=false;\n";
+  s += "function setFields(st){\n";
   s += "document.getElementById('mode').value=st.mode?1:0;\n";
   s += "document.getElementById('tconst').value=st.tconst.toFixed(1);\n";
   s += "document.getElementById('maxp').value=st.maxp.toFixed(0);\n";
@@ -1693,25 +1791,33 @@ static String controlPage()
   s += "document.getElementById('dispon').value=st.dispon?1:0;\n";
   s += "document.getElementById('wlovr').value=st.level_ovr?1:0;\n";
   s += "for(let i=0;i<st.inv.length;i++) document.getElementById('inv'+i).checked=st.inv[i];\n";
+  s += "}\n";
+  s += "async function refresh(){\n";
+  s += "const st=await jget('/api/state');\n";
+  // Always update read-only text...
+  s += "document.getElementById('status').textContent=fmtState(st);\n";
+  s += "document.getElementById('net').textContent='IP: '+st.ip+'  SSID: '+st.ssid+'  (try http://tec-ctrl.local/)';\n";
   s += "document.getElementById('snip').textContent=st.invert_snippet;\n";
+  // ...but populate editable form fields only once, so the 1s poll doesn't
+  // clobber a value you're typing/selecting before you can hit Apply.
+  s += "if(!formInit){setFields(st);formInit=true;}\n";
   s += "}\n";
   s += "async function setPower(v){await jpost('/api/control',{on:!!v});refresh();}\n";
   s += "async function clearFault(){await jpost('/api/fault_clear',{});refresh();}\n";
   s += "async function saveControl(){\n";
   s += "const obj={mode:document.getElementById('mode').value==='1',tconst:parseFloat(tconst.value),maxp:parseFloat(maxp.value)};\n";
-  s += "await jpost('/api/control',obj);refresh();}\n";
+  s += "const st=await jpost('/api/control',obj);setFields(st);refresh();}\n";
   s += "async function savePumpDisp(){\n";
   s += "const obj={pumpen:document.getElementById('pumpen').value==='1',pumpspd:parseFloat(document.getElementById('pumpspd').value),dispon:document.getElementById('dispon').value==='1',wlovr:document.getElementById('wlovr').value==='1'};\n";
-  s += "await jpost('/api/control',obj);refresh();}\n";
+  s += "const st=await jpost('/api/control',obj);setFields(st);refresh();}\n";
   s += "async function saveInvert(){\n";
   s += "let inv=[];for(let i=0;i<4;i++) inv.push(!!document.getElementById('inv'+i).checked);\n";
-  s += "await jpost('/api/invert',{inv});refresh();}\n";
+  s += "const st=await jpost('/api/invert',{inv});setFields(st);refresh();}\n";
   s += "async function startTest(){\n";
-  s += "const chan=parseInt(document.getElementById('mchan').value);\n";
-  s += "const heat=document.getElementById('mdir').value==='1';\n";
-  s += "const duty=parseFloat(document.getElementById('mduty').value)/100.0;\n";
+  s += "let duty=[],heat=[];\n";
+  s += "for(let i=0;i<4;i++){duty.push((parseFloat(document.getElementById('mduty'+i).value)||0)/100.0);heat.push(document.getElementById('mdir'+i).value==='1');}\n";
   s += "const dur=parseFloat(document.getElementById('mdur').value)*1000;\n";
-  s += "await jpost('/api/test',{chan,heat,duty,dur});refresh();}\n";
+  s += "await jpost('/api/test',{duty,heat,dur});refresh();}\n";
   s += "async function stopTest(){await jpost('/api/test_stop',{});refresh();}\n";
   s += "async function setProfilePoint(){\n";
   s += "const hour=parseInt(document.getElementById('ph').value);\n";
